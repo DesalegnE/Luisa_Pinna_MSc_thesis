@@ -1,0 +1,546 @@
+# Load necessary libraries
+library(phyloseq)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(picante)
+library(ape)
+library(rstatix)
+library(RColorBrewer)
+library(vegan)
+library(DESeq2)
+library(pairwiseAdonis)
+library(pheatmap)
+library(gridExtra)
+library(car)
+library(ggpubr)
+library(rstatix)
+library(reshape2)
+library(DescTools)
+library(multcompView)
+# Load the data
+metadata <- read.csv("Metadata_Luisa.csv", row.names = 1)
+otu_table <- read.csv("emu-combined-silva-counts_OTU.csv", row.names = 1)
+taxonomy <- read.csv("Taxonomy.csv", row.names = 1)
+tree <- ape::read.nexus("Luisa_rooted_tree.tre")
+
+# Exclude samples
+samples_to_exclude <- c("SBC_PS", "BR_SBC_PS", "PS1", "PS2", "PS3", "PS4", "PS5", "EGG", "GUT", "ExceptGUT")
+metadata <- metadata[!(row.names(metadata) %in% samples_to_exclude), ]
+
+# Filter OTU table
+counts_filtered <- otu_table[, !(colnames(otu_table) %in% samples_to_exclude)]
+otu_table <- counts_filtered[rowSums(counts_filtered) > 0, ]
+
+# Filter taxonomy
+otu_ids_in_counts <- rownames(otu_table)
+taxonomy_filtered <- taxonomy[rownames(taxonomy) %in% otu_ids_in_counts, ]
+
+# Prune the tree
+included_otus <- rownames(otu_table)
+tree_labels <- tree$tip.label
+otus_to_remove <- setdiff(tree_labels, included_otus)
+pruned_tree <- ape::drop.tip(tree, otus_to_remove)
+
+# Re-root the tree
+if (!"8793" %in% tree$tip.label) {
+  stop("Outgroup '8793' not found in tree tip labels.")
+}
+tree <- ape::root(pruned_tree, outgroup = "8793")
+
+# Create phyloseq object
+OTU <- otu_table(as.matrix(otu_table), taxa_are_rows = TRUE)
+TAX <- tax_table(as.matrix(taxonomy_filtered))
+META <- sample_data(metadata)
+physeq <- phyloseq(OTU, TAX, META, tree)
+
+#Alpha diversity analyss 
+# Compute Faith's Phylogenetic Diversity
+compute_faith_pd <- function(otu_mat, tree) {
+  faith_pd <- numeric(ncol(otu_mat))
+  for (i in seq_len(ncol(otu_mat))) {
+    sample_otu <- otu_mat[, i]
+    sample_otu <- sample_otu[sample_otu > 0]
+    if (length(sample_otu) > 0) {
+      tree_subset <- keep.tip(tree, names(sample_otu))
+      faith_pd[i] <- sum(ape::cophenetic.phylo(tree_subset)[, 1])
+    } else {
+      faith_pd[i] <- NA
+    }
+  }
+  return(faith_pd)
+}
+
+otu_mat <- as(otu_table(physeq), "matrix")
+faith_pd <- compute_faith_pd(otu_mat, tree)
+alpha_div <- estimate_richness(physeq, measures = c("Shannon", "Simpson", "Observed"))
+alpha_div$Faith_PD <- faith_pd
+alpha_div <- alpha_div %>%
+  rownames_to_column(var = "Sample")
+sample_data_df <- as.data.frame(sample_data(physeq))
+sample_data_df$Sample <- rownames(sample_data_df)
+alpha_div <- alpha_div %>%
+  left_join(sample_data_df, by = "Sample")
+write.csv(alpha_div, "alpha_diversity_metrics.csv", row.names = FALSE)
+
+# Box plots
+desired_order <- c("BR", "BRF", "BRP", "BRPF", "PR", "PRF", "PRB", "PRBF")
+
+plot_diversity_metrics_boxplot <- function(data, metric, file_name) {
+  data$Treatment <- factor(data$Treatment, levels = desired_order)
+  p <- ggplot(data, aes(x = Treatment, y = .data[[metric]])) +
+    geom_boxplot(fill = "skyblue", color = "black") +
+    geom_jitter(width = 0.2, alpha = 0.5, color = "darkblue") +
+    theme_minimal() +
+    labs(
+      title = paste("Box Plot of Diversity Metric:", metric),
+      x = "Treatment",
+      y = metric
+    ) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.line = element_line(color = "black", size = 0.5),
+      panel.border = element_rect(color = "black", fill = NA, size = 1),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank()
+    )
+  ggsave(filename = file_name, plot = p, width = 10, height = 6)
+}
+library(ggplot2)
+plot_diversity_metrics_boxplot(alpha_div, "Shannon", "Shannon_diversity_boxplot.pdf")
+plot_diversity_metrics_boxplot(alpha_div, "Simpson", "Simpson_diversity_boxplot.pdf")
+plot_diversity_metrics_boxplot(alpha_div, "Observed", "Observed_diversity_boxplot.pdf")
+plot_diversity_metrics_boxplot(alpha_div, "Faith_PD", "Faith_PD_diversity_boxplot.pdf")
+
+#Significance test
+
+# Read the data from CSV file
+alpha_div <- read.csv("alpha_diversity_metrics.csv")
+
+# Function to check assumptions
+check_assumptions <- function(data, metric) {
+  # Ensure Treatment is a factor
+  data$Treatment <- as.factor(data$Treatment)
+  
+  shapiro_test <- shapiro.test(data[[metric]])$p.value
+  levene_test <- leveneTest(as.formula(paste(metric, "~ Treatment")), data = data)$`Pr(>F)`[1]
+  
+  list(normality = shapiro_test > 0.05, homogeneity = levene_test > 0.05)
+}
+
+# Function to perform the appropriate test and post-hoc analysis
+perform_analysis <- function(data, metric) {
+  assumptions <- check_assumptions(data, metric)
+  
+  if (assumptions$normality && assumptions$homogeneity) {
+    # Parametric test: ANOVA and Tukey's HSD
+    test_result <- aov(as.formula(paste(metric, "~ Treatment")), data = data)
+    test_summary <- summary(test_result)[[1]]
+    post_hoc <- TukeyHSD(test_result)$Treatment
+    post_hoc_df <- as.data.frame(post_hoc)
+    post_hoc_df$Comparison <- rownames(post_hoc_df)
+  } else {
+    # Non-parametric test: Kruskal-Wallis and Dunn's test
+    test_result <- kruskal.test(as.formula(paste(metric, "~ Treatment")), data = data)
+    test_summary <- data.frame(
+      Statistic = test_result$statistic,
+      P_value = test_result$p.value
+    )
+    dunn_result <- dunn.test(data[[metric]], data$Treatment, method = "bh")
+    post_hoc_df <- data.frame(
+      Comparison = dunn_result$comparisons,
+      p.adj = dunn_result$P.adjusted
+    )
+  }
+  
+  return(list(test_summary = test_summary, post_hoc = post_hoc_df))
+}
+library(dunn.test)
+# List of metrics
+metrics <- c("Shannon", "Simpson", "Observed", "Faith_PD")
+
+# Process each metric and save results
+results <- lapply(metrics, function(metric) {
+  test_results <- perform_analysis(alpha_div, metric)
+  
+  # Save the main test summary
+  write.csv(test_results$test_summary, paste0(metric, "_test_summary.csv"), row.names = TRUE)
+  
+  # Save post-hoc test results, if available
+  if (!is.null(test_results$post_hoc) && nrow(test_results$post_hoc) > 0) {
+    write.csv(test_results$post_hoc, paste0(metric, "_post_hoc_comparisons.csv"), row.names = FALSE)
+  }
+})
+
+
+
+# Beta Diversity Analysis
+# Compute Bray-Curtis distance and perform PCoA
+physeq_hellinger <- transform_sample_counts(physeq, function(x) sqrt(x / sum(x)))
+bray_curtis_dist <- vegdist(t(otu_table(physeq_hellinger)), method = "bray")
+print(bray_curtis_dist)
+# Ensure metadata in physeq_hellinger has the correct Treatment factor levels
+sample_data(physeq_hellinger)$Treatment <- factor(sample_data(physeq_hellinger)$Treatment, levels = desired_order)
+
+# Perform PCoA on the Hellinger-transformed data
+pcoa_result <- ordinate(physeq_hellinger, method = "PCoA", distance = "bray")
+
+# Calculate the proportion of variance explained by each axis
+explained_variance <- pcoa_result$values$Relative_eig * 100
+pcoa1_var <- round(explained_variance[1], 2)
+pcoa2_var <- round(explained_variance[2], 2)
+
+# Plot PCoA with Treatment ordered according to desired_order
+pcoa_plot <- plot_ordination(physeq_hellinger, pcoa_result, color = "Treatment") +
+  geom_point(size = 3, alpha = 0.7) +
+  theme_bw() +
+  labs(
+    title = "PCoA of Bacterial Communities (Hellinger Transformed)",
+    x = paste0("PCo1 (", pcoa1_var, "%)"),
+    y = paste0("PCo2 (", pcoa2_var, "%)"),
+    caption = "Based on Bray-Curtis dissimilarity"
+  ) +
+  theme(
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text = element_text(size = 10),
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 12, face = "bold")
+  ) +
+  scale_color_manual(values = brewer.pal(n = length(desired_order), name = "Set3"))
+
+# Save the plot
+ggsave("pcoa_plot_hellinger.pdf", pcoa_plot, width = 10, height = 8)
+
+
+# Print the sample labels
+sample_ids <- attr(bray_curtis_dist, "Labels")
+print(sample_ids)
+
+# Convert the distance object to a matrix
+dist_matrix_full <- as.matrix(bray_curtis_dist)
+
+# Check dimensions of the matrix
+dim(dist_matrix_full)
+
+# Verify if all samples are present
+identical(sample_ids, rownames(metadata_hellinger))
+
+
+# PERMANOVA analysis
+permanova_result <- adonis2(dist_matrix_full ~ Treatment, data = metadata_hellinger)
+write.csv(permanova_result, "permanova_results.csv")
+
+# Print PERMANOVA result
+print(permanova_result)
+
+# Ensure correct sample names and metadata alignment
+metadata_hellinger$SampleID <- rownames(metadata_hellinger)
+dist_matrix_full <- dist_matrix_full[metadata_hellinger$SampleID, metadata_hellinger$SampleID]
+
+# Perform pairwise comparisons using the adonis function
+pairwise_results <- pairwise.adonis(dist_matrix_full, metadata_hellinger$Treatment, p.adjust.m = "bonferroni")
+write.csv(pairwise_results, "pairwise_results_bonferroni.csv")
+# Check if the results were correctly computed
+if (!is.null(pairwise_results)) {
+  write.csv(pairwise_results, "pairwise_comparisons_results.csv")
+  print(pairwise_results)
+} else {
+  print("No pairwise results were generated. Please check the inputs.")
+}
+
+
+#Taxa bar plots
+
+# Define a function for creating taxa bar plots with DESeq2 analysis
+analyze_taxa <- function(physeq, taxrank, filename_prefix) {
+  # Agglomerate taxa at the specified taxonomic level
+  physeq_taxa <- tax_glom(physeq, taxrank = taxrank)
+  
+  # Convert the agglomerated phyloseq object to DESeq2 format
+  deseq_data_taxa <- phyloseq_to_deseq2(physeq_taxa, ~ Treatment)
+  
+  # Filter out any samples with zero counts (needed for DESeq2)
+  deseq_data_taxa <- deseq_data_taxa[rowSums(counts(deseq_data_taxa)) > 0, ]
+  
+  # Check for zero counts across all samples
+  if (any(rowSums(counts(deseq_data_taxa)) == 0)) {
+    warning("One or more taxa have zero counts across all samples. These will be removed.")
+    deseq_data_taxa <- deseq_data_taxa[rowSums(counts(deseq_data_taxa)) > 0, ]
+  }
+  
+  # Perform differential abundance analysis
+  deseq_result_taxa <- DESeq(deseq_data_taxa)
+  res_taxa <- results(deseq_result_taxa, pAdjustMethod = "BH")
+  
+  # Order results by adjusted p-value and select the top 20 significant taxa
+  res_taxa_ordered <- res_taxa[order(res_taxa$padj, na.last = NA), ]
+  top_taxa <- head(rownames(res_taxa_ordered), 20)
+  
+  # Filter the phyloseq object to keep only the top 20 significant taxa
+  physeq_top_taxa <- prune_taxa(top_taxa, physeq_taxa)
+  
+  # Transform to relative abundance for plotting
+  physeq_top_taxa_rel <- transform_sample_counts(physeq_top_taxa, function(x) x / sum(x))
+  
+  # Melt the phyloseq object for ggplot
+  melted_physeq_top_taxa <- psmelt(physeq_top_taxa_rel)
+  
+  # Ensure the Treatment column has the correct levels and order
+  melted_physeq_top_taxa$Treatment <- factor(melted_physeq_top_taxa$Treatment, levels = desired_order)
+  
+  # Define a custom color palette based on the number of taxa
+  n_colors <- length(unique(melted_physeq_top_taxa[[taxrank]]))
+  custom_palette <- c(brewer.pal(8, "Set2"), brewer.pal(8, "Set1"), brewer.pal(8, "Set3"))
+  if (n_colors > length(custom_palette)) {
+    additional_colors <- colorRampPalette(custom_palette)(n_colors - length(custom_palette))
+    custom_palette <- c(custom_palette, additional_colors)
+  }
+  custom_palette <- custom_palette[1:n_colors]
+  
+  # Create the taxa bar plot
+  taxa_plot_top_taxa <- ggplot(melted_physeq_top_taxa, aes(x = Sample, y = Abundance, fill = .data[[taxrank]])) +
+    geom_bar(stat = "identity") +
+    facet_wrap(~Treatment, scales = "free_x", nrow = 1) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+          legend.position = "right",
+          legend.key.size = unit(0.5, "cm")) +
+    labs(x = "Sample", y = "Relative Abundance", fill = taxrank) +
+    scale_fill_manual(values = custom_palette)
+  
+  # Save the plot
+  ggsave(paste0(filename_prefix, "_taxa_barplot_top_", taxrank, ".pdf"), taxa_plot_top_taxa, width = 20, height = 10)
+}
+
+# Perform analysis for family, genus, and species levels
+analyze_taxa(physeq, "family", "family")
+analyze_taxa(physeq, "genus", "genus")
+analyze_taxa(physeq, "species", "species")
+
+# Function to perform differential abundance analysis
+perform_diff_abundance <- function(physeq, condition1, condition2) {
+  subset_physeq <- prune_samples(sample_data(physeq)$Treatment %in% c(condition1, condition2), physeq)
+  sample_data(subset_physeq)$condition <- factor(sample_data(subset_physeq)$Treatment, levels = c(condition1, condition2))
+  
+  deseq_data <- phyloseq_to_deseq2(subset_physeq, ~ condition)
+  deseq_result <- DESeq(deseq_data)
+  res <- results(deseq_result, contrast = c("condition", condition2, condition1))
+  
+  return(res)
+}
+
+# 1. Influence of intercropping on rhizosphere bacteriome (with/out TR4 infection)
+intercrop_on_banana_rhizo <- perform_diff_abundance(physeq, "BR", "BRP")
+intercrop_on_pintoi_rhizo <- perform_diff_abundance(physeq, "PR", "PRB")
+
+intercrop_TR4_on_banana_rhizo <- perform_diff_abundance(physeq, "BRF", "BRPF")
+intercrop_TR4_on_pintoi_rhizo <- perform_diff_abundance(physeq, "PRF", "PRBF")
+
+
+# 2. Influence of TR4 on bacterial community
+TR4_on_banana_rhizo <- perform_diff_abundance(physeq, "BR", "BRF")
+TR4_on_pinto_rhizo <- perform_diff_abundance(physeq, "PR", "PRF")
+
+# Function to get top differentially abundant taxa
+get_top_taxa <- function(res, n = 20) {
+  res_ordered <- res[order(res$padj), ]
+  top_taxa <- head(rownames(res_ordered), n)
+  return(top_taxa)
+}
+
+# Get top differentially abundant taxa for each comparison
+top_intercrop_on_banana_rhizo <- get_top_taxa(intercrop_on_banana_rhizo)
+top_intercrop_on_pintoi_rhizo <- get_top_taxa(intercrop_on_pintoi_rhizo)
+
+top_intercrop_TR4_on_banana_rhizo <- get_top_taxa(intercrop_TR4_on_banana_rhizo)
+top_intercrop_TR4_on_pintoi_rhizo <- get_top_taxa(intercrop_TR4_on_pintoi_rhizo)
+
+
+top_TR4_on_banana_rhizo <- get_top_taxa(TR4_on_banana_rhizo)
+top_TR4_on_pinto_rhizo <- get_top_taxa(TR4_on_pinto_rhizo)
+
+# Function to create a heatmap for differentially abundant taxa with species-level annotations
+create_heatmap <- function(physeq, top_taxa, conditions, title) {
+  subset_physeq <- prune_samples(sample_data(physeq)$Treatment %in% conditions, physeq)
+  subset_physeq <- prune_taxa(top_taxa, subset_physeq)
+  
+  otu_table <- log2(otu_table(subset_physeq) + 1)
+  tax_table <- tax_table(subset_physeq)
+  
+  # Ensure taxonomic labels include the lowest available taxonomic level
+  tax_labels <- apply(tax_table, 1, function(x) {
+    # Define the order of taxonomic levels from lowest to highest
+    levels <- c("species", "genus", "family", "order", "class", "phylum")
+    # Find the first non-empty taxonomic level
+    label <- "Unknown"
+    for (level in levels) {
+      if (!is.na(x[level]) && x[level] != "") {
+        label <- x[level]
+        break
+      }
+    }
+    return(label)
+  })
+  
+  rownames(otu_table) <- tax_labels
+  
+  annotation_col <- data.frame(Treatment = sample_data(subset_physeq)$Treatment)
+  rownames(annotation_col) <- sample_names(subset_physeq)
+  
+  pheatmap(otu_table,
+           annotation_col = annotation_col,
+           main = title,
+           scale = "row",
+           cluster_cols = FALSE,
+           fontsize_row = 8,
+           fontsize_col = 8,
+           filename = paste0(gsub(" ", "_", title), "_heatmap.pdf"),
+           width = 10,
+           height = 12)
+}
+
+# Function to create a heatmap for differentially abundant taxa with species-level annotations
+create_heatmap <- function(physeq, top_taxa, conditions, title) {
+  # Prune samples and taxa based on specified conditions and top taxa
+  subset_physeq <- prune_samples(sample_data(physeq)$Treatment %in% conditions, physeq)
+  subset_physeq <- prune_taxa(top_taxa, subset_physeq)
+  
+  # Transform OTU table to log scale
+  otu_table <- log2(otu_table(subset_physeq) + 1)
+  tax_table <- tax_table(subset_physeq)
+  
+  # Ensure taxonomic labels include the lowest available taxonomic level or OTU ID
+  tax_labels <- apply(tax_table, 1, function(x) {
+    # Define the order of taxonomic levels from lowest to highest
+    levels <- c("species", "genus", "family", "order", "class", "phylum")
+    # Find the first non-empty taxonomic level
+    label <- "Unknown"
+    for (level in levels) {
+      if (!is.na(x[level]) && x[level] != "") {
+        label <- x[level]
+        break
+      }
+    }
+    # If no label found, use the OTU ID
+    if (label == "Unknown" || label == "") {
+      label <- rownames(tax_table)[which(x == rownames(tax_table))]
+    }
+    return(label)
+  })
+  
+  # Set rownames of OTU table to taxonomic labels or OTU IDs
+  rownames(otu_table) <- tax_labels
+  
+  # Prepare the annotation for the heatmap columns
+  annotation_col <- data.frame(Treatment = sample_data(subset_physeq)$Treatment)
+  rownames(annotation_col) <- sample_names(subset_physeq)
+  
+  # Create and save the heatmap
+  pheatmap(otu_table,
+           annotation_col = annotation_col,
+           main = title,
+           scale = "row",
+           cluster_cols = FALSE,
+           fontsize_row = 8,
+           fontsize_col = 8,
+           filename = paste0(gsub(" ", "_", title), "_heatmap.pdf"),
+           width = 10,
+           height = 12)
+}
+
+
+# Create heatmaps with species-level annotations
+
+create_heatmap(physeq, top_intercrop_on_banana_rhizo, c("BR", "BRP"), "Intercropping Effect on banana rhizosphere")
+create_heatmap(physeq, top_intercrop_on_pintoi_rhizo, c("PR", "PRB"), "Intercropping Effect on pintoi rhizosphere")
+
+create_heatmap(physeq, top_intercrop_TR4_on_banana_rhizo, c("BRF", "BRPF"), "Intercropping and TR4 Effect on banana rhizosphere")
+create_heatmap(physeq, top_intercrop_TR4_on_pintoi_rhizo, c("PRF", "PRBF"), "Intercropping and TR4 Effect on pintoi rhizosphere")
+
+create_heatmap(physeq, top_TR4_on_banana_rhizo, c("BR", "BRF"), "TR4 Effect on banana rhizosphere")
+create_heatmap(physeq, top_TR4_on_pinto_rhizo, c("PR", "PRF"), "TR4 Effect on pintoi rhizosphere")
+
+# Function to create a volcano plot
+create_volcano_plot <- function(res, title) {
+  df <- as.data.frame(res)
+  df$significant <- ifelse(df$padj < 0.05 & abs(df$log2FoldChange) > 1, "Significant", "Not Significant")
+  
+  ggplot(df, aes(x = log2FoldChange, y = -log10(padj), color = significant)) +
+    geom_point(alpha = 0.6) +
+    scale_color_manual(values = c("Significant" = "red", "Not Significant" = "grey")) +
+    theme_bw() +
+    labs(title = title,
+         x = "Log2 Fold Change",
+         y = "-Log10 Adjusted P-value") +
+    theme(legend.position = "bottom")
+}
+
+# Create volcano plots
+
+volcano_intercrop_on_banana_rhizo <- create_volcano_plot(intercrop_on_banana_rhizo, "Intercropping Effect on banana rhizosphere")
+volcano_intercrop_on_pintoi_rhizo <- create_volcano_plot(intercrop_on_pintoi_rhizo, "Intercropping Effect on pintoi rhizosphere")
+
+volcano_intercrop_TR4_on_banana_rhizo <- create_volcano_plot(intercrop_TR4_on_banana_rhizo, "Intercropping and TR4 Effect on banana rhizosphere")
+volcano_intercrop_TR4_on_pintoi_rhizo <- create_volcano_plot(intercrop_TR4_on_pintoi_rhizo, "Intercropping and TR4 Effect on pintoi rhizosphere")
+
+volcano_TR4_on_banana_rhizo <- create_volcano_plot(TR4_on_banana_rhizo, "TR4 Effect on banana rhizosphere")
+volcano_TR4_on_pinto_rhizo <- create_volcano_plot(TR4_on_pinto_rhizo, "TR4 Effect on pintoi rhizosphere")
+
+# Combine volcano plots
+
+library(gridExtra)
+
+# Define the layout matrix
+layout_matrix <- rbind(c(1, 2, NA),
+                       c(3, 4, NA),
+                       c(5, 6, NA))
+
+# Arrange the plots in the specified order
+combined_volcano <- grid.arrange(
+  volcano_intercrop_on_banana_rhizo, 
+  volcano_intercrop_on_pintoi_rhizo,
+  volcano_intercrop_TR4_on_banana_rhizo,
+  volcano_intercrop_TR4_on_pintoi_rhizo,
+  volcano_TR4_on_banana_rhizo, 
+  volcano_TR4_on_pinto_rhizo,
+  layout_matrix = layout_matrix
+)
+
+# Save the combined plots as a PDF
+ggsave("combined_volcano_plots.pdf", combined_volcano, width = 16, height = 16)
+
+
+# Identify common changes in both hosts due to TR4 infection
+common_TR4_effect_on_rhizo <- intersect(top_TR4_on_banana_rhizo, top_TR4_on_pinto_rhizo)
+
+# Create a heatmap for common TR4 effects on both hosts
+create_heatmap(physeq, common_TR4_effect_on_rhizo, c("BR", "BRF", "PR", "PRF"), "Common TR4 Effects on Banana and Pintoi rhizosphere")
+
+# Perform PERMANOVA
+dist_matrix <- phyloseq::distance(physeq, method = "bray")
+permanova_result <- adonis2(dist_matrix ~ sample_data(physeq)$Treatment)
+write.csv(permanova_result, "permanova_results.csv")
+
+# Create a summary table of differentially abundant taxa
+create_summary_table <- function(res, comparison) {
+  res_df <- as.data.frame(res)
+  res_df$comparison <- comparison
+  res_df$taxon <- rownames(res_df)
+  res_df <- res_df[order(res_df$padj), ]
+  res_df <- head(res_df, 20)
+  return(res_df[, c("comparison", "taxon", "log2FoldChange", "padj")])
+}
+
+summary_table <- rbind(
+  create_summary_table(intercrop_on_banana_rhizo, "Intercropping Effect on banana rhizosphere"),
+  create_summary_table(intercrop_on_pintoi_rhizo, "Intercropping Effect on pintoi rhizosphere"),
+  create_summary_table(intercrop_TR4_on_banana_rhizo, "Intercropping and TR4 Effect on banana rhizosphere"),
+  create_summary_table(intercrop_TR4_on_pintoi_rhizo, "Intercropping and TR4 Effect on pintoi rhizosphere"),
+  
+  create_summary_table(TR4_on_banana_rhizo, "TR4 Effect on banana rhizosphere"),
+  create_summary_table(TR4_on_pinto_rhizo, "TR4 Effect on pintoi rhizosphere")
+)
+
+write.csv(summary_table, "differential_abundance_summary.csv", row.names = FALSE)
+
