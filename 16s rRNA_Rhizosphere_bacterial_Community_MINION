@@ -1,3 +1,5 @@
+
+#The rhizosphere bacteriome of banana and Arachis pintoi, both infected and non-infected with Fusarium oxysporum TR4, was sequenced using Oxford Nanopore Technology (ONT) R10.4.1. These plants were grown either separately or together. The data was then preprocessed using the NEMMAP package (https://git.wur.nl/robbert.vanhimbeeck/nemmap), resulting in an OTU table and corresponding sequences, which were used to build a rooted phylogenetic tree.
 # Load necessary libraries
 library(phyloseq)
 library(dplyr)
